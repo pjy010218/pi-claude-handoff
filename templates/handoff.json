@@ -1,0 +1,5 @@
+{
+  "contextFiles": ["AGENTS.md", "CLAUDE.md"],
+  "agentsDir": ".pi/agents",
+  "workLog": { "file": "CLAUDE.md", "heading": "Work Log" }
+}

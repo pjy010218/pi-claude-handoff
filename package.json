@@ -1,0 +1,58 @@
+{
+  "name": "pi-claude-handoff",
+  "version": "0.1.0",
+  "description": "Claude Code plans, Pi's agents do the work in front of you: a tasks.json handoff queue with visible execution, gates, and validated reports",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "claude-code",
+    "subagents",
+    "handoff",
+    "planner-worker"
+  ],
+  "license": "MIT",
+  "author": "Junyeong Park",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pjy010218/pi-claude-handoff.git"
+  },
+  "homepage": "https://github.com/pjy010218/pi-claude-handoff#readme",
+  "bugs": {
+    "url": "https://github.com/pjy010218/pi-claude-handoff/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src",
+    "templates",
+    "docs",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test tests/watcher.test.mjs",
+    "check": "node --check src/watcher.mjs && npm test",
+    "prepublishOnly": "npm run check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": ">=1.1.0",
+    "pi-subagents": "*"
+  },
+  "peerDependenciesMeta": {
+    "pi-subagents": {
+      "optional": true
+    }
+  }
+}
