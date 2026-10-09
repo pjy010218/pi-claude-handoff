@@ -510,17 +510,19 @@ test("work-log append rejects a level-two heading after the work log", (t) => {
 test("work-log append refuses a replaced file and never truncates a concurrent append", (t) => {
   const root = makeRoot(t);
   const claude = path.join(root, "CLAUDE.md");
-  let replaceBeforeOpen = true;
+  let replaceDuringWrite = true;
   const replacedFs = proxyFs({
-    openSync(file, flags, mode) {
-      if (replaceBeforeOpen && path.basename(String(file)) === "CLAUDE.md") {
-        replaceBeforeOpen = false;
-        fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("_None yet._", "Other note..."));
+    writeSync(fd, buffer, offset, length) {
+      if (replaceDuringWrite) {
+        // Another writer swaps in a new file after the checks, before the append lands.
+        replaceDuringWrite = false;
+        fs.writeFileSync(`${claude}.new`, "# replaced\n\n## Work Log\nOther note\n");
+        fs.renameSync(`${claude}.new`, claude);
       }
-      return fs.openSync(file, flags, mode);
+      return fs.writeSync(fd, buffer, offset, length);
     },
   });
-  assert.throws(() => appendWorkLog(root, pending(), "ERROR", "replacement check", replacedFs), /changed while its work-log section was being checked/);
+  assert.throws(() => appendWorkLog(root, pending(), "ERROR", "replacement check", replacedFs), /was replaced during the work-log append/);
   assert.match(fs.readFileSync(claude, "utf8"), /Other note/);
   assert.doesNotMatch(fs.readFileSync(claude, "utf8"), /replacement check/);
 
@@ -623,4 +625,64 @@ test("failed visible handoff records ERROR instead of leaving an unowned RUNNING
   assert.equal(env.readQueue().status, "ERROR");
   assert.match(env.readQueue().error, /Visible task handoff failed/);
   assert.equal(env.messages.length, 0);
+});
+
+// Security review 2026-10-09 (security-review/REVIEW.md), R2-R5 regressions.
+test("R2: a report that would make tasks.json exceed its read limit is refused and the task stays RUNNING", async (t) => {
+  const env = makeEnv(t, { initialQueue: pending() });
+  await startWatch(env);
+  const tests = Array.from({ length: 100 }, (_, i) => `${String(i).padStart(3, "0")}${"測".repeat(2045)}`);
+  await assert.rejects(invokeReport(env, completionReport({ tests_run: tests })), /over the 262144-byte limit/);
+  assert.equal(readQueue(env.root).queue.status, "RUNNING");
+  await invokeReport(env, completionReport());
+  assert.equal(env.readQueue().status, "COMPLETE");
+});
+
+test("R3: oversized files are rejected without reading them whole", (t) => {
+  const root = makeRoot(t);
+  fs.writeFileSync(path.join(root, "tasks.json"), " ".repeat(1024 * 1024));
+  let bytesRead = 0;
+  const observed = proxyFs({
+    readFileSync(...args) { const out = fs.readFileSync(...args); bytesRead += out.length; return out; },
+    readSync(...args) { const n = fs.readSync(...args); bytesRead += n; return n; },
+  });
+  assert.throws(() => readQueue(root, observed), /exceeds the 262144-byte limit/);
+  assert.ok(bytesRead <= 256 * 1024 + 1, `read ${bytesRead} bytes`);
+});
+
+test("R4: the work log refuses a hard-linked file shared outside the project", (t) => {
+  const root = makeRoot(t);
+  const outside = makeRoot(t);
+  const externalFile = path.join(outside, "CLAUDE.md");
+  const before = fs.readFileSync(externalFile, "utf8");
+  fs.unlinkSync(path.join(root, "CLAUDE.md"));
+  fs.linkSync(externalFile, path.join(root, "CLAUDE.md"));
+  assert.throws(() => appendWorkLog(root, pending(), "ERROR", "must not escape"), /hard links/);
+  assert.equal(fs.readFileSync(externalFile, "utf8"), before);
+});
+
+test("R5: worker, gate and async evidence is persisted in the queue and work log", async (t) => {
+  const env = makeEnv(t, { initialQueue: pending({ gate: "review-after", gate_reason: "security review" }) });
+  await startWatch(env);
+  const gate = {
+    gate: "review-after", agent: "example-reviewer", run_id: "unique-review-evidence", status: "COMPLETE",
+    result: "Verdict: OK with notes. Rotate the test-only token before shipping.", independent: true,
+    model: "provider/example-model", thinking: "high",
+  };
+  const response = await invokeReport(env, completionReport({ gate_evidence: [gate] }));
+  const saved = env.readQueue();
+  assert.equal(saved.status, "COMPLETE");
+  assert.equal(saved.report.version, 1);
+  assert.equal(saved.report.worker.run_id, "writer-run-1");
+  assert.equal(saved.report.gate_evidence[0].run_id, "unique-review-evidence");
+  assert.match(saved.report.gate_evidence[0].result, /Rotate the test-only token/);
+  assert.deepEqual(saved.report.async_status, { checked: true, pending_run_ids: [], failed_run_ids: [] });
+  assert.deepEqual(response.details.report, saved.report);
+  assert.match(fs.readFileSync(path.join(env.root, "CLAUDE.md"), "utf8"), /review-after by example-reviewer: Verdict: OK with notes/);
+});
+
+test("R5: a new task clears the previous task's report when it starts", async (t) => {
+  const env = makeEnv(t, { initialQueue: pending({ report: { version: 1, stale: true } }) });
+  await startWatch(env);
+  assert.equal(env.readQueue().report, null);
 });

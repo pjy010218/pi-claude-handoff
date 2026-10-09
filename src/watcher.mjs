@@ -5,6 +5,11 @@ import { createHash, randomUUID } from "node:crypto";
 const QUEUE_SCHEMA = 3;
 const QUEUE_MAX_BYTES = 256 * 1024;
 const CONTEXT_MAX_BYTES = 128 * 1024;
+const CONFIG_MAX_BYTES = 16 * 1024;
+const PROFILE_MAX_BYTES = 64 * 1024;
+const MAX_PROFILES = 256;
+const LOCK_MAX_BYTES = 4 * 1024;
+const WORKLOG_MAX_BYTES = 4 * 1024 * 1024;
 const STATUSES = new Set(["IDLE", "PENDING", "RUNNING", "COMPLETE", "ERROR"]);
 const TASK_TYPES = new Set(["IMPLEMENT", "TEST", "DOCUMENT", "CONSULT", "REVIEW"]);
 const ROLES = new Set(["any", "writer", "read-only"]);
@@ -78,11 +83,35 @@ function safeProjectFile(root, relative, io, kind = "file") {
   return { path: actual, stat };
 }
 
+/** Reads at most maxBytes + 1 from an open descriptor, after checking its size, so a limit bounds memory and time. */
+function readFdBounded(io, fd, maxBytes, label) {
+  const stat = io.fstatSync(fd);
+  if (!stat.isFile()) throw new Error(`${label} is not a regular file.`);
+  if (stat.size > maxBytes) throw new Error(`${label} exceeds the ${maxBytes}-byte limit.`);
+  const buffer = Buffer.alloc(Math.min(maxBytes, stat.size) + 1);
+  let offset = 0;
+  while (offset < buffer.length) {
+    const count = io.readSync(fd, buffer, offset, buffer.length - offset, offset);
+    if (count <= 0) break;
+    offset += count;
+  }
+  if (offset > maxBytes || offset > stat.size) throw new Error(`${label} exceeds the ${maxBytes}-byte limit or grew while being read.`);
+  return buffer.subarray(0, offset).toString("utf8");
+}
+
+function readBounded(file, io, maxBytes, label) {
+  const fd = io.openSync(file, io.constants.O_RDONLY | (io.constants.O_NOFOLLOW ?? 0));
+  try {
+    return readFdBounded(io, fd, maxBytes, label);
+  } finally {
+    io.closeSync(fd);
+  }
+}
+
 function readStrictJson(file, io, maxBytes, label) {
   const stat = io.lstatSync(file);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`${label} must be a regular, non-symlink file.`);
-  const raw = io.readFileSync(file, "utf8");
-  if (Buffer.byteLength(raw, "utf8") > maxBytes) throw new Error(`${label} exceeds the ${maxBytes}-byte limit.`);
+  const raw = readBounded(file, io, maxBytes, label);
   let value;
   try {
     value = JSON.parse(raw);
@@ -103,6 +132,9 @@ function validateQueueShape(queue) {
     if (!Object.hasOwn(queue, key) || !Array.isArray(queue[key]) || queue[key].some((item) => typeof item !== "string")) {
       throw new Error(`tasks.json field ${key} must be an array of strings.`);
     }
+  }
+  if (Object.hasOwn(queue, "report") && queue.report !== null && !isPlainObject(queue.report)) {
+    throw new Error("tasks.json field report must be an object or null.");
   }
   if (queue.status === "IDLE" && queue.task_type !== "" && !TASK_TYPES.has(queue.task_type)) {
     throw new Error("IDLE tasks.json has an invalid task_type.");
@@ -193,7 +225,7 @@ export function loadConfig(root, io = fs) {
     throw error;
   }
   const { path: actual } = safeProjectFile(project, CONFIG_FILE, io);
-  const { value } = readStrictJson(actual, io, 16 * 1024, CONFIG_FILE);
+  const { value } = readStrictJson(actual, io, CONFIG_MAX_BYTES, CONFIG_FILE);
   for (const key of Object.keys(value)) if (!Object.hasOwn(DEFAULT_CONFIG, key)) throw new Error(`${CONFIG_FILE} has unsupported key ${key}.`);
   const config = structuredClone(DEFAULT_CONFIG);
   if (value.contextFiles !== undefined) {
@@ -233,12 +265,18 @@ function parseFrontmatter(text, filename) {
 function listProfiles(root, io, agentsDir = DEFAULT_CONFIG.agentsDir) {
   const { path: directory } = safeProjectFile(root, agentsDir, io, "directory");
   const profiles = new Map();
+  let count = 0;
   for (const entry of io.readdirSync(directory, { withFileTypes: true })) {
     if (!entry.name.endsWith(".md") || !entry.isFile()) continue;
     const file = path.join(directory, entry.name);
     if (io.lstatSync(file).isSymbolicLink()) continue;
-    const text = io.readFileSync(file, "utf8");
-    if (Buffer.byteLength(text, "utf8") > 64 * 1024) continue;
+    if (++count > MAX_PROFILES) throw new Error(`More than ${MAX_PROFILES} agent profiles; refusing to scan them all.`);
+    let text;
+    try {
+      text = readBounded(file, io, PROFILE_MAX_BYTES, entry.name);
+    } catch {
+      continue; // oversized or unreadable profiles are not eligible agents
+    }
     const profile = parseFrontmatter(text, entry.name);
     if (!profile) continue;
     if (profiles.has(profile.name)) throw new Error(`Ambiguous agent profile name: ${profile.name}.`);
@@ -374,33 +412,43 @@ export function appendWorkLog(root, queue, status, summary, io = fs, workLog = D
   if (!workLog) return;
   const project = safeRoot(root, io);
   const { path: file, stat: originalStat } = safeProjectFile(project, workLog.file, io);
-  const existing = io.readFileSync(file, "utf8");
-  // The heading may carry a section number ("## 8. Work Log") and trailing text ("## Work Log (newest last)").
-  const headingPattern = new RegExp(`^## (?:\\d+\\.\\s*)?${escapeRegExp(workLog.heading)}(?![\\w])[^\\n]*$`, "gm");
-  const headers = [...existing.matchAll(headingPattern)];
-  const afterWorkLog = headers.length ? existing.slice(headers[0].index + headers[0][0].length) : "";
-  if (headers.length !== 1 || /^##(?!#)(?:[ \t]+|$)/m.test(afterWorkLog)) {
-    throw new Error(`${workLog.file} "${workLog.heading}" section is missing, duplicated, or no longer the final level-two section; refusing to append.`);
-  }
+  // One descriptor for checking and appending, so the checked file is the file that is written.
   const flags = io.constants.O_RDWR | io.constants.O_APPEND | (io.constants.O_NOFOLLOW ?? 0);
   const fd = io.openSync(file, flags);
   let startSize;
   let startIno;
+  let startDev;
   let bytes;
   let bytesWritten = 0;
   try {
     const before = io.fstatSync(fd);
     startSize = before.size;
     startIno = before.ino;
-    if (startIno !== originalStat.ino || startSize !== Buffer.byteLength(existing, "utf8") || io.readFileSync(fd, "utf8") !== existing) {
+    startDev = before.dev;
+    if (startIno !== originalStat.ino || startDev !== originalStat.dev) {
       throw new Error(`${workLog.file} changed while its work-log section was being checked; refusing to append.`);
+    }
+    // A hard link is a regular file inside the project that shares bytes with a file elsewhere.
+    if (before.nlink !== 1) {
+      throw new Error(`${workLog.file} has ${before.nlink} hard links; refusing to append to a file shared outside the project.`);
+    }
+    const existing = readFdBounded(io, fd, WORKLOG_MAX_BYTES, workLog.file);
+    if (Buffer.byteLength(existing, "utf8") !== startSize) {
+      throw new Error(`${workLog.file} changed while its work-log section was being checked; refusing to append.`);
+    }
+    // The heading may carry a section number ("## 8. Work Log") and trailing text ("## Work Log (newest last)").
+    const headingPattern = new RegExp(`^## (?:\\d+\\.\\s*)?${escapeRegExp(workLog.heading)}(?![\\w])[^\\n]*$`, "gm");
+    const headers = [...existing.matchAll(headingPattern)];
+    const afterWorkLog = headers.length ? existing.slice(headers[0].index + headers[0][0].length) : "";
+    if (headers.length !== 1 || /^##(?!#)(?:[ \t]+|$)/m.test(afterWorkLog)) {
+      throw new Error(`${workLog.file} "${workLog.heading}" section is missing, duplicated, or no longer the final level-two section; refusing to append.`);
     }
     const line = taskLogLine(queue, status, summary);
     bytes = Buffer.from(`${existing.endsWith("\n") ? "" : "\n"}${line}`, "utf8");
     writeAllSync(io, fd, bytes, (written) => { bytesWritten += written; });
     io.fsyncSync(fd);
     const after = io.lstatSync(file);
-    if (after.isSymbolicLink() || after.ino !== startIno) throw new Error(`${workLog.file} was replaced during the work-log append.`);
+    if (after.isSymbolicLink() || after.ino !== startIno || after.dev !== startDev) throw new Error(`${workLog.file} was replaced during the work-log append.`);
   } catch (error) {
     if (startSize !== undefined && bytes && bytesWritten > 0) {
       try {
@@ -444,14 +492,18 @@ export function atomicPatchQueue(root, expected, patch, io = fs, hooks = {}) {
   const current = readQueue(project, io);
   if (!freshSnapshotMatches(current, expected)) throw new Error("Queue identity or state changed; refusing to replace tasks.json.");
   const next = { ...current.queue, ...patch };
+  const nextBytes = Buffer.from(`${JSON.stringify(next, null, 2)}\n`, "utf8");
+  // Never write a queue the watcher itself would refuse to read back.
+  if (nextBytes.length > QUEUE_MAX_BYTES) {
+    throw new Error(`The updated tasks.json would be ${nextBytes.length} bytes, over the ${QUEUE_MAX_BYTES}-byte limit; nothing was written. Shorten result, tests_run or evidence.`);
+  }
   const tempName = `.tasks.json.pi-${process.pid}-${randomUUID()}.tmp`;
   const tempFile = path.join(project, tempName);
   const mode = current.stat?.mode ? current.stat.mode & 0o777 : safeProjectFile(project, "tasks.json", io).stat.mode & 0o777;
   let fd;
   try {
     fd = io.openSync(tempFile, "wx", mode);
-    const bytes = Buffer.from(`${JSON.stringify(next, null, 2)}\n`, "utf8");
-    writeAllSync(io, fd, bytes);
+    writeAllSync(io, fd, nextBytes);
     io.fsyncSync(fd);
     io.closeSync(fd);
     fd = undefined;
@@ -459,7 +511,7 @@ export function atomicPatchQueue(root, expected, patch, io = fs, hooks = {}) {
     const latest = readQueue(project, io);
     if (!freshSnapshotMatches(latest, expected)) throw new Error("Queue identity or state changed before atomic rename; replacement was not written.");
     io.renameSync(tempFile, current.file);
-    return { queue: next, rawHash: sha(`${JSON.stringify(next, null, 2)}\n`), fingerprint: current.fingerprint, file: current.file, root: project };
+    return { queue: next, rawHash: sha(nextBytes), fingerprint: current.fingerprint, file: current.file, root: project };
   } finally {
     if (fd !== undefined) io.closeSync(fd);
     try {
@@ -524,7 +576,7 @@ export function acquireOwnership(root, sessionId, io = fs, deps = {}) {
   }
   const stat = io.lstatSync(lockPath);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Watcher lock is not a regular file; refusing ownership.");
-  const first = io.readFileSync(lockPath, "utf8");
+  const first = readBounded(lockPath, io, LOCK_MAX_BYTES, "Watcher lock");
   let previous;
   try { previous = JSON.parse(first); } catch { throw new Error("Watcher lock is incomplete or malformed; inspect it and remove it manually only after confirming no watcher is active."); }
   if (!validOwner(previous)) throw new Error("Watcher lock has an invalid owner record; refusing automatic recovery.");
@@ -536,7 +588,7 @@ export function acquireOwnership(root, sessionId, io = fs, deps = {}) {
     throw error;
   }
   try {
-    const second = io.readFileSync(lockPath, "utf8");
+    const second = readBounded(lockPath, io, LOCK_MAX_BYTES, "Watcher lock");
     if (second !== first) throw new Error("Watcher lock changed during stale-owner recovery; refusing to remove it.");
     io.unlinkSync(lockPath);
     return createOwner();
@@ -548,7 +600,7 @@ export function acquireOwnership(root, sessionId, io = fs, deps = {}) {
 export function releaseOwnership(lock, io = fs) {
   if (!lock) return false;
   try {
-    const current = io.readFileSync(lock.path, "utf8");
+    const current = readBounded(lock.path, io, LOCK_MAX_BYTES, "Watcher lock");
     const owner = JSON.parse(current);
     if (!validOwner(owner) || owner.nonce !== lock.owner.nonce || owner.sessionId !== lock.owner.sessionId || owner.pid !== lock.owner.pid) return false;
     io.unlinkSync(lock.path);
@@ -569,8 +621,7 @@ function contextFiles(root, io, names = DEFAULT_CONFIG.contextFiles) {
       throw error;
     }
     const { path: file } = safeProjectFile(root, name, io);
-    const text = io.readFileSync(file, "utf8");
-    if (Buffer.byteLength(text, "utf8") > CONTEXT_MAX_BYTES) throw new Error(`${name} exceeds the shared-context size limit.`);
+    const text = readBounded(file, io, CONTEXT_MAX_BYTES, name);
     files.push({ name, text });
   }
   return files;
@@ -635,7 +686,7 @@ export const EMPTY_QUEUE = Object.freeze({
   gate: "none", gate_reason: "", parent_task_id: "", assigned_agent: "", assigned_model: "", thinking: "",
   instruction: "", working_dir: ".", scope: [], acceptance_criteria: [], plan_ref: "", created_at: "",
   created_by: "claude-code", started_at: "", completed_at: "", updated_by: "", result: "", files_changed: [],
-  tests_run: [], error: "",
+  tests_run: [], error: "", report: null,
 });
 
 /** Creates an IDLE tasks.json if none exists. Never overwrites anything. */
@@ -768,8 +819,25 @@ export function installWatcher(pi, Type, deps = {}) {
       if (input.worker.status !== "COMPLETE") throw new Error("A pending or failed worker blocks COMPLETE.");
     }
     const at = now().toISOString();
+    const evidence = (entry) => ({
+      agent: entry.agent, run_id: entry.run_id, status: entry.status, model: entry.model,
+      thinking: entry.thinking ?? "", result: oneLine(entry.result, 4000),
+    });
+    // Durable, bounded copy of the validated evidence, so the planner can read the gate's verdict.
+    const report = {
+      version: 1,
+      captured_at: at,
+      worker: input.worker ? evidence(input.worker) : null,
+      gate_evidence: input.gate_evidence.map((entry) => ({ gate: entry.gate, independent: true, ...evidence(entry) })),
+      async_status: {
+        checked: true,
+        pending_run_ids: [...input.async_status.pending_run_ids],
+        failed_run_ids: [...input.async_status.failed_run_ids],
+      },
+    };
     const patch = {
       status: input.status,
+      report,
       assigned_agent: input.worker?.agent ?? "",
       assigned_model: input.worker?.model ?? "",
       thinking: input.worker?.thinking ?? "",
@@ -782,9 +850,10 @@ export function installWatcher(pi, Type, deps = {}) {
     };
     const saved = atomicPatchQueue(root, current, patch, io, deps);
     try {
+      const gateNote = report.gate_evidence.map((entry) => `; ${entry.gate} by ${entry.agent}: ${oneLine(entry.result, 80)}`).join("");
       appendWorkLog(root, saved.queue, input.status, input.status === "COMPLETE"
-        ? `${saved.queue.task_type} completed; ${patch.files_changed.length} files, ${patch.tests_run.length} tests; report recorded.`
-        : `${saved.queue.task_type} ended ERROR; see tasks.json error field.`, io, config.workLog);
+        ? `${saved.queue.task_type} completed; ${patch.files_changed.length} files, ${patch.tests_run.length} tests${gateNote}`
+        : `${saved.queue.task_type} ended ERROR; see tasks.json error field${gateNote}`, io, config.workLog);
     } catch (error) {
       const visibleError = `Work-log append failed: ${oneLine(error.message, 250)}. COMPLETE was withheld; review tasks.json and repair the work log.`;
       if (input.status === "COMPLETE") {
@@ -822,7 +891,7 @@ export function installWatcher(pi, Type, deps = {}) {
     const queue = snapshot.queue;
     const startedAt = now().toISOString();
     const running = atomicPatchQueue(root, snapshot, {
-      status: "RUNNING", started_at: startedAt, completed_at: "", updated_by: "pi", error: "",
+      status: "RUNNING", started_at: startedAt, completed_at: "", updated_by: "pi", error: "", report: null,
     }, io, deps);
     activeTask = { taskId: queue.task_id, fingerprint: snapshot.fingerprint, startedAt };
     updateUi(`watching · RUNNING · ${oneLine(queue.task_id, 60)}`);
@@ -990,7 +1059,7 @@ export function installWatcher(pi, Type, deps = {}) {
     async execute(_toolCallId, input, _signal, _onUpdate, toolCtx) {
       ctx = toolCtx;
       const saved = reportTask(input);
-      return { content: [{ type: "text", text: `Task ${saved.task_id} recorded ${saved.status}; files=${saved.files_changed.length}, tests=${saved.tests_run.length}.` }], details: undefined };
+      return { content: [{ type: "text", text: `Task ${saved.task_id} recorded ${saved.status}; files=${saved.files_changed.length}, tests=${saved.tests_run.length}.` }], details: { report: saved.report } };
     },
   });
   const asyncToolCalls = new Set();

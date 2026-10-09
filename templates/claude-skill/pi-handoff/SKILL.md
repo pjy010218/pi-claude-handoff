@@ -46,10 +46,11 @@ Rules the watcher enforces (otherwise it marks the task `ERROR`):
 
 ## Review a result
 
-1. When the user asks, read `tasks.json`: `status`, `assigned_agent`, `assigned_model`, `result`, `files_changed`, `tests_run`, `error`, and the last line of the Work Log.
+1. When the user asks, read `tasks.json`: `status`, `assigned_agent`, `assigned_model`, `result`, `files_changed`, `tests_run`, `error`, the `report` object (worker and gate run IDs, and each gate reviewer's `result`), and the last line of the Work Log.
+   `COMPLETE` means the work and any required review finished. It does not mean the reviewer approved: read `report.gate_evidence[].result` for the verdict, and treat a BLOCK as changes required.
 2. Check the actual changes (for example `git diff` on `files_changed`) and whether the tests and acceptance criteria are really satisfied. The report is the agents' claim, not proof.
 3. Give the user your verdict. If changes are needed, queue a follow-up with `parent_task_id` set to the reviewed task.
-4. Reset the queue: `status: "IDLE"` and empty the task and report fields (keep `schema_version: 3`, `required_role: "any"`, `gate: "none"`, `working_dir: "."`, `created_by: "claude-code"`).
+4. Reset the queue: `status: "IDLE"`, empty the task and report fields, and set `report` to `null` (keep `schema_version: 3`, `required_role: "any"`, `gate: "none"`, `working_dir: "."`, `created_by: "claude-code"`).
 
 ## When something is off
 
