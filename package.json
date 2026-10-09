@@ -1,6 +1,6 @@
 {
   "name": "pi-claude-handoff",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Claude Code plans, Pi's agents do the work in front of you: a tasks.json handoff queue with visible execution, gates, and validated reports",
   "type": "module",
   "engines": {
